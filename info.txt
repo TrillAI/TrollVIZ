@@ -1,0 +1,203 @@
+Below are clear, practical instructions and ready-to-use snippets for building and signing your Android app (TrillViz) both from Android Studio and the command line—plus verification, Play Console details, and a short CI example (GitHub Actions). I also include safe patterns for storing signing secrets.
+
+Summary (quick)
+- For development: use the debug build (Android Studio Run).
+- For production: create a release keystore, add signingConfig to app/build.gradle (use gradle.properties for secrets), build an AAB (recommended) or signed APK, verify signatures, and upload the AAB to Google Play (enable Play App Signing).
+- For CI: keep keystore contents in a secure secret (BASE64) and decode at build time.
+
+1) Create a release keystore (one time)
+- Use keytool (comes with the JDK). Replace placeholders.
+
+keytool command example:
+```bash
+keytool -genkeypair -v \
+  -keystore trillviz-release.keystore \
+  -alias trillviz_key \
+  -keyalg RSA -keysize 2048 \
+  -validity 10000 \
+  -storepass YOUR_STORE_PASS \
+  -keypass YOUR_KEY_PASS \
+  -dname "CN=TrillViz, OU=Trill, O=YourCompany, L=City, ST=State, C=US"
+```
+Notes:
+- Keep the keystore file and passwords secret. Do NOT commit to Git.
+- Store in a safe place (backups). Losing it may prevent updates to the app signed with that key.
+
+2) Add signing config to Gradle (secure approach)
+- Add the keystore and passwords via gradle.properties (local, not committed) and reference them in app/build.gradle.
+
+Create ~/.gradle/gradle.properties or project-level gradle.properties (NOT committed):
+```
+TRILL_KEYSTORE_PATH=/home/<you>/keystores/trillviz-release.keystore
+TRILL_KEYSTORE_PASSWORD=your_store_password_here
+TRILL_KEY_ALIAS=trillviz_key
+TRILL_KEY_PASSWORD=your_key_password_here
+```
+
+app/build.gradle (snippets to add inside android { ... }):
+```groovy
+signingConfigs {
+    release {
+        storeFile file(project.hasProperty('TRILL_KEYSTORE_PATH') ? TRILL_KEYSTORE_PATH : "keystores/trillviz-release.keystore")
+        storePassword project.hasProperty('TRILL_KEYSTORE_PASSWORD') ? TRILL_KEYSTORE_PASSWORD : ""
+        keyAlias project.hasProperty('TRILL_KEY_ALIAS') ? TRILL_KEY_ALIAS : ""
+        keyPassword project.hasProperty('TRILL_KEY_PASSWORD') ? TRILL_KEY_PASSWORD : ""
+    }
+}
+
+buildTypes {
+    release {
+        signingConfig signingConfigs.release
+        minifyEnabled true            // optional: enable R8/ProGuard
+        proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+    }
+}
+```
+Notes:
+- Use environment-specific gradle.properties on CI or local dev; do not check secrets into the repo.
+
+3) Build signed AAB or APK (command line)
+- App Bundle (AAB) is recommended for Play Store.
+
+Build signed AAB (uses signingConfig):
+```bash
+./gradlew clean bundleRelease
+# Output: app/build/outputs/bundle/release/app-release.aab
+```
+
+Or build signed APK:
+```bash
+./gradlew clean assembleRelease
+# Output: app/build/outputs/apk/release/app-release.apk
+```
+
+4) Verify the signed APK/AAB
+- For APKs, use apksigner:
+
+Verify signature:
+```bash
+# Verify APK signature(s)
+$ANDROID_HOME/build-tools/<build-tools-version>/apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk
+```
+Output will show certificate fingerprints (SHA-1, SHA-256) and which signature scheme used (v1/v2/v3).
+
+- For AAB you upload to Play; to locally test AAB you can use bundletool to generate APK set and install:
+
+Install bundletool and generate/install APKs (local test):
+```bash
+# Download bundletool.jar from https://github.com/google/bundletool/releases
+java -jar bundletool.jar build-apks --bundle=app-release.aab --output=app-release.apks --mode=universal --ks=trillviz-release.keystore --ks-pass=pass:YOUR_STORE_PASS --ks-key-alias=trillviz_key --key-pass=pass:YOUR_KEY_PASS
+
+# Install (requires device connected)
+java -jar bundletool.jar install-apks --apks=app-release.apks
+```
+
+5) Upload to Google Play (recommended flow)
+- Sign in to Play Console → Create App → Fill listing, privacy policy, content rating, etc.
+- In Release → Create a release → Upload the app-release.aab produced by bundleRelease.
+- Play App Signing:
+  - Recommended: opt in. Play will manage the app signing key and you upload an Upload Key (you can let Play generate one or register your own). If you already have an existing app, follow Play Console prompts for upload key rotation if needed.
+- After upload, follow rollout steps (internal testing, open/closed testing, production).
+
+6) Generate fingerprint (SHA-1) for API keys (Firebase, Google APIs)
+- Use keytool to get SHA-1 (for release keystore):
+```bash
+keytool -list -v -keystore trillviz-release.keystore -alias trillviz_key -storepass YOUR_STORE_PASS -keypass YOUR_KEY_PASS
+# Look for SHA1: and SHA256:
+```
+- If using Play App Signing, Play will re-sign app with its key; you can find Play app signing certificate fingerprints in Play Console (App Integrity section) and use that for APIs.
+
+7) Local testing of a release-signed APK
+- Install with adb:
+```bash
+adb uninstall com.trill.trillviz         # remove debug if installed
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+- If using an AAB and bundletool install-apks then the app will be installed on device for test.
+
+8) CI: GitHub Actions example (secure keystore handling)
+- Keep keystore as a base64-encoded secret in GitHub Secrets (e.g. TRILL_KEYSTORE_BASE64), and store passwords as secrets.
+
+Example workflow snippet (.github/workflows/android-build.yml):
+```yaml
+name: Android Release Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Decode keystore
+        env:
+          KEY_B64: ${{ secrets.TRILL_KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEY_B64" | base64 --decode > trillviz-release.keystore
+          mkdir -p ~/.gradle
+          # store gradle properties
+          cat <<EOF > ~/.gradle/gradle.properties
+TRILL_KEYSTORE_PATH=$(pwd)/trillviz-release.keystore
+TRILL_KEYSTORE_PASSWORD=${{ secrets.TRILL_KEYSTORE_PASSWORD }}
+TRILL_KEY_ALIAS=${{ secrets.TRILL_KEY_ALIAS }}
+TRILL_KEY_PASSWORD=${{ secrets.TRILL_KEY_PASSWORD }}
+EOF
+
+      - name: Build bundle
+        run: ./gradlew clean bundleRelease --no-daemon
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: app/build/outputs/bundle/release/app-release.aab
+```
+Notes:
+- Use secrets to store the keystore password, alias, and key password.
+- Remove the keystore file after build if desired (cleanup step).
+
+9) Play App Signing: upload key vs app signing key
+- Google Play App Signing stores the final app signing key. When you upload an AAB to Play:
+  - If you opt-in to Play App Signing for a new app, Google will ask if they should manage signing keys. They will use the Upload Key you sign with to verify your uploads, and re-sign final APKs with the App Signing Key.
+  - If you're migrating, follow Play Console instructions to register an upload key or request upload key reset.
+- Always provide Play with the correct certificate fingerprints (SHA-1) if APIs rely on them.
+
+10) Extra best practices & tips
+- Never commit keystore or passwords to source control. Add keystores/ to .gitignore.
+- Use gradle.properties or environment variables (CI secrets) rather than hardcoding in build.gradle.
+- Use AAB for Play; use APK only for direct installs or alternative stores.
+- Enable PROGUARD/R8 for release builds to shrink/obfuscate code. Add keep rules for ML Kit / TFLite if minifying (test release build thoroughly).
+- Test both the unsigned debug and signed release builds (behavior may differ due to proguard or resources).
+- If your app uses native libraries (TFLite GPU etc.) test on target devices / architectures (arm64-v8a, armeabi-v7a). Use ABI splits if needed:
+  - In build.gradle you can enable splits { abi { enable true; reset()... } } so Play serves correct APK per device, but with AAB Play will manage splitting automatically.
+
+11) Signing scheme (v1/v2/v3)
+- Modern Android uses v2/v3 signing schemes for faster install verification. apksigner will sign with v2/v3 automatically when building with the Android Gradle plugin; verify with apksigner verify --print-certs. Play also supports these schemes.
+
+12) Troubleshooting
+- If Play rejects a upload because of key mismatch: you probably used a different keystore. If you lost your release key and haven't used Play App Signing, you cannot update the app with the same package name (you must publish a new app). If you enrolled in Play App Signing, you can request an upload key reset.
+- If TFLite GPU delegate crashes in release build: test with GPU disabled or try NNAPI. Some devices require different delegates or driver updates.
+
+13) Quick checklist for release
+- Keystore created & backed up
+- signingConfigs set and secrets stored securely
+- Build & test release locally
+- ProGuard/R8 rules set for libraries (ML Kit/TFLite)
+- AAB generated and uploaded to Play Console internal testing
+- Privacy policy and store listing prepared
+- SHA fingerprints added where needed (APIs)
+
+If you want, I can:
+- Provide a ready-to-use gradle.properties.example and a sample app/build.gradle file with signingConfig filled (with placeholders) using the file block format so you can copy-paste.
+- Provide a complete GitHub Actions workflow file that builds the AAB and optionally uploads it to Google Play (fastlane + supply) — will require setting Play Console service account secrets.
+- Explain how to produce an upload key for Play App Signing if you plan to let Google manage the final signing key.
+
+Which of these would you like next? (I can immediately give the gradle.properties.example and complete build.gradle snippet or produce the GitHub Actions workflow for your repo.)
